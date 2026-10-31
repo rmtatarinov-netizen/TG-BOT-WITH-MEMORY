@@ -1,0 +1,5 @@
+/.env
+/.venv
+/index_shared_document.py
+/uploads
+/__pycache__
