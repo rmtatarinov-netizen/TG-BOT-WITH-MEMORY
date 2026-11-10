@@ -23,15 +23,32 @@ from typing import List, Optional
 
 import chromadb
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+try:
+    from aiohttp_socks import ProxyConnectionError, ProxyTimeoutError
+except ImportError:
+    ProxyConnectionError = ProxyTimeoutError = OSError
+
+NETWORK_ERRORS = (TelegramNetworkError, ProxyConnectionError, ProxyTimeoutError, OSError)
+
 load_dotenv()
 
-os.environ["NO_PROXY"] = "*"
-os.environ["no_proxy"] = "*"
+
+def _extend_no_proxy() -> None:
+    extra = {"api.proxyapi.ru", "localhost", "127.0.0.1"}
+    for key in ("NO_PROXY", "no_proxy"):
+        current = {item.strip() for item in os.getenv(key, "").split(",") if item.strip()}
+        current.update(extra)
+        os.environ[key] = ",".join(sorted(current))
+
+
+_extend_no_proxy()
 
 # Опциональные зависимости для парсинга документов
 try:
@@ -50,6 +67,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip() or None
 PROXYAPI_API_KEY = os.getenv("PROXYAPI_API_KEY", "").strip()
 PROXYAPI_BASE_URL = os.getenv("PROXYAPI_BASE_URL", "").strip() or None
 
@@ -57,23 +75,25 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small").strip()
 CHAT_MODEL = os.getenv("CHAT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
 
 PERSIST_DIR = "./memory"  # папка для ChromaDB
-UPLOADS_DIR = "./uploads"  # папка для загруженных файлов
+RAG_KNOWLEDGE_DIR = "./rag_knowledge"  # папка для файлов базы знаний
 COLLECTION_NAME = "long_memory"
 SHARED_USER_ID = "shared"  # документы, доступные всем пользователям
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 TOP_K = 5
+SEND_CHUNK = 4000
 
 # Сколько пар "пользователь + ассистент" помнить (10 пар = 20 сообщений).
 MEMORY_PAIRS = 10
 MAX_HISTORY_MESSAGES = MEMORY_PAIRS * 2
 
-# Лимит Telegram — 4096 символов; отправляем кусками чуть меньше лимита.
-SEND_CHUNK = 4000
+# Список администраторов, имеющих право пополнять базу RAG
+ADMIN_IDS = [int(i) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip()]
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный и полезный ассистент в Telegram. "
+    "Ты предназначен для консультации по компании «Medlife Insurance Ltd.» "
     "Отвечай на языке пользователя, кратко и по делу. "
     "Учитывай контекст предыдущих сообщений диалога. "
     "Если ниже передан контекст из загруженных документов, используй его, "
@@ -108,7 +128,7 @@ def require_env(var_name: str) -> str:
 
 def ensure_dirs() -> None:
     Path(PERSIST_DIR).mkdir(parents=True, exist_ok=True)
-    Path(UPLOADS_DIR).mkdir(parents=True, exist_ok=True)
+    Path(RAG_KNOWLEDGE_DIR).mkdir(parents=True, exist_ok=True)
 
 
 def get_lock(user_id: int) -> asyncio.Lock:
@@ -212,19 +232,18 @@ async def embed_texts(client: AsyncOpenAI, texts: List[str]) -> List[List[float]
 
 async def embed_chunks(
     client: AsyncOpenAI,
-    user_id: object,
     doc_id: str,
     chunks: List[str],
 ) -> int:
-    """Вычислить эмбеддинги чанков и сохранить их в Chroma с метаданными."""
+    """Вычислить эмбеддинги чанков и сохранить их в Chroma с метаданными (только для общей базы)."""
     if not chunks:
         return 0
     collection = get_chroma_collection()
     embeddings = await embed_texts(client, chunks)
 
-    ids = [f"{user_id}:{doc_id}:{i}:{uuid.uuid4().hex}" for i in range(len(chunks))]
+    ids = [f"{SHARED_USER_ID}:{doc_id}:{i}:{uuid.uuid4().hex}" for i in range(len(chunks))]
     metadatas = [
-        {"user_id": str(user_id), "doc_id": doc_id, "chunk_index": i}
+        {"user_id": SHARED_USER_ID, "doc_id": doc_id, "chunk_index": i}
         for i in range(len(chunks))
     ]
     await asyncio.to_thread(
@@ -239,25 +258,21 @@ async def embed_chunks(
 
 async def retrieve_context(
     client: AsyncOpenAI,
-    user_id: int,
     question: str,
     top_k: int = TOP_K,
 ) -> List[str]:
-    """Найти релевантные фрагменты личных и общих документов пользователя."""
+    """Найти релевантные фрагменты из общей базы знаний."""
     collection = get_chroma_collection()
     total = await asyncio.to_thread(collection.count)
     if total == 0:
         return []
 
     q_emb = (await embed_texts(client, [question]))[0]
-    owner_filter = {
-        "$or": [{"user_id": str(user_id)}, {"user_id": SHARED_USER_ID}]
-    }
     result = await asyncio.to_thread(
         collection.query,
         query_embeddings=[q_emb],
         n_results=top_k,
-        where=owner_filter,
+        where={"user_id": SHARED_USER_ID},
     )
     docs = result.get("documents") or []
     if not docs:
@@ -290,13 +305,17 @@ async def ask_model(client: AsyncOpenAI, messages: List[dict[str, str]]) -> str:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        "Привет! Я бот с короткой и долгой памятью.\n\n"
-        "Короткая память: я помню последние 10 пар сообщений нашего диалога.\n"
-        "Долгая память: пришлите PDF/TXT/DOCX — я проиндексирую документ и буду "
-        "отвечать на вопросы по нему.\n\n"
+        "Здравствуйте! Я AI-помощник компании Medlife Insurance Ltd.\n"
+        "Помогу разобраться в программах страхования жизни и накопления капитала, "
+        "расскажу об условиях и подготовлю вас к консультации со специалистом.\n\n"
+        "Что для вас сейчас важнее?\n"
+        "— Финансовая защита семьи.\n"
+        "— Накопления на будущее ребёнка.\n"
+        "— Инвестиции и формирование капитала.\n"
+        "— Подготовка к пенсии.\n"
+        "— Страхование сотрудников компании.\n\n"
         "Команды:\n"
         "/reset — очистить историю диалога\n"
-        "/reset_docs — удалить ваши загруженные документы\n"
         "/help — краткая справка"
     )
 
@@ -305,10 +324,8 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     await message.answer(
         "Как пользоваться:\n"
-        "1. Просто напишите вопрос — ответ придёт с учётом истории диалога.\n"
-        "2. Отправьте документ PDF/TXT/DOCX — после индексации задавайте вопросы по нему.\n"
-        "3. /reset — очистить короткую память.\n"
-        "4. /reset_docs — удалить ваши документы из долгой памяти."
+        "1. Просто напишите вопрос или отправьте голосовое сообщение — я отвечу, используя историю диалога и базу знаний компании.\n"
+        "2. /reset — очистить короткую память."
     )
 
 
@@ -326,22 +343,9 @@ async def cmd_reset(message: Message) -> None:
     await message.answer("История диалога очищена. Начнём заново!")
 
 
-@router.message(Command("reset_docs"))
-async def cmd_reset_docs(message: Message) -> None:
-    if message.from_user is None:
-        await message.answer("Не удалось определить пользователя.")
-        return
-
-    user_id = message.from_user.id
-    try:
-        await delete_user_documents(user_id)
-    except Exception:
-        logger.exception("Ошибка удаления документов для user_id=%s", user_id)
-        await message.answer("Не удалось удалить документы. Попробуйте позже.")
-        return
-
-    logger.info("Документы удалены для user_id=%s", user_id)
-    await message.answer("Ваши документы удалены из долгой памяти.")
+# ---------------------------------------------------------------------------
+# Документы (долгая память)
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -351,19 +355,23 @@ async def cmd_reset_docs(message: Message) -> None:
 
 @router.message(F.document)
 async def on_document(message: Message, bot: Bot, openai_client: AsyncOpenAI) -> None:
-    """Скачать документ, проиндексировать и сохранить в Chroma."""
+    """Скачать документ, проиндексировать и сохранить в Chroma. Только для админов."""
     if message.from_user is None or message.document is None:
         return
 
     user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        await message.answer("У вас нет прав для загрузки документов в базу знаний.")
+        return
+
     doc = message.document
 
     ensure_dirs()
-    user_dir = Path(UPLOADS_DIR) / str(user_id)
-    user_dir.mkdir(parents=True, exist_ok=True)
+    save_dir = Path(RAG_KNOWLEDGE_DIR)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     file_name = Path(doc.file_name or f"file_{uuid.uuid4().hex}").name
-    save_path = user_dir / file_name
+    save_path = save_dir / file_name
 
     try:
         await bot.download(doc, destination=str(save_path))
@@ -384,15 +392,15 @@ async def on_document(message: Message, bot: Bot, openai_client: AsyncOpenAI) ->
 
     doc_id = uuid.uuid4().hex
     try:
-        count = await embed_chunks(openai_client, user_id, doc_id, chunks)
+        count = await embed_chunks(openai_client, doc_id, chunks)
     except Exception:
         logger.exception("Embedding/Chroma error")
         await message.answer("Ошибка при сохранении в векторную базу.")
         return
 
     await message.answer(
-        f"Документ «{file_name}» сохранён и проиндексирован. "
-        f"Чанков: {count}. Теперь задайте вопрос."
+        f"Документ «{file_name}» сохранён в общую базу знаний и проиндексирован. "
+        f"Чанков: {count}."
     )
 
 
@@ -402,14 +410,14 @@ async def on_document(message: Message, bot: Bot, openai_client: AsyncOpenAI) ->
 
 
 @router.message(F.text & ~F.via_bot)
-async def on_text(message: Message, openai_client: AsyncOpenAI) -> None:
-    """Ответить с учётом истории диалога и документов пользователя."""
+async def on_text(message: Message, openai_client: AsyncOpenAI, processed_text: Optional[str] = None) -> None:
+    """Ответить с учётом истории диалога и общей базы знаний."""
     if message.from_user is None:
         await message.answer("Не удалось определить пользователя.")
         return
 
     user_id = message.from_user.id
-    text = (message.text or "").strip()
+    text = (processed_text or message.text or "").strip()
     if not text:
         await message.answer("Пришлите, пожалуйста, текстовое сообщение.")
         return
@@ -419,7 +427,7 @@ async def on_text(message: Message, openai_client: AsyncOpenAI) -> None:
     async with get_lock(user_id):
         context_chunks: List[str] = []
         try:
-            context_chunks = await retrieve_context(openai_client, user_id, text)
+            context_chunks = await retrieve_context(openai_client, text)
         except Exception:
             logger.exception("Retrieve error для user_id=%s", user_id)
 
@@ -457,9 +465,44 @@ async def on_text(message: Message, openai_client: AsyncOpenAI) -> None:
         await message.answer(chunk)
 
 
-@router.message()
-async def on_other(message: Message) -> None:
-    await message.answer("Пока я умею работать только с текстом и документами PDF/TXT/DOCX.")
+@router.message(F.voice)
+async def on_voice(message: Message, openai_client: AsyncOpenAI) -> None:
+    """Обработка голосовых сообщений через OpenAI Whisper."""
+    if message.from_user is None or message.voice is None:
+        return
+
+    user_id = message.from_user.id
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    try:
+        # Скачиваем голосовое сообщение во временный файл
+        file_info = await message.voice.get_file()
+        file_path = Path(f"voice_{user_id}_{uuid.uuid4().hex}.ogg")
+        await message.bot.download_file(file_info.file_path, destination=str(file_path))
+
+        # Распознаем голос через Whisper API
+        with open(file_path, "rb") as audio_file:
+            transcription = await openai_client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-1",
+            )
+
+        text = transcription.text.strip()
+        # Удаляем временный файл
+        file_path.unlink()
+
+        if not text:
+            await message.answer("Не удалось распознать речь в вашем сообщении.")
+            return
+
+        # Передаем распознанный текст в основной обработчик текста
+        await on_text(message, openai_client, processed_text=text)
+
+    except Exception:
+        logger.exception("Voice processing error для user_id=%s", user_id)
+        await message.answer("Произошла ошибка при обработке голосового сообщения.")
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +522,8 @@ async def main() -> None:
     if not PROXYAPI_API_KEY:
         raise SystemExit("Не задана переменная окружения PROXYAPI_API_KEY")
 
-    bot = Bot(token=BOT_TOKEN)
+    session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else None
+    bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
     dp.include_router(router)
 
@@ -493,6 +537,13 @@ async def main() -> None:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Бот с короткой и долгой памятью запущен. Модель: %s", CHAT_MODEL)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except NETWORK_ERRORS as exc:
+        logger.error(
+            "Нет связи с api.telegram.org: %s. Подключите VPN или задайте "
+            "TELEGRAM_PROXY в .env (например, http://127.0.0.1:12334).",
+            exc,
+        )
+        raise SystemExit(1) from exc
     finally:
         await openai_client.close()
         await bot.session.close()

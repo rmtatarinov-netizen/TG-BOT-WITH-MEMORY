@@ -1,0 +1,11 @@
+.env
+.env.*
+.venv
+.git
+.gitignore
+__pycache__
+*.pyc
+memory
+rag_knowledge
+uploads
+*.zip

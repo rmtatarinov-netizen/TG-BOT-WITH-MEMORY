@@ -1,5 +1,7 @@
 /.env
 /.venv
-/index_shared_document.py
 /uploads
+/rag_knowledge
+/memory
 /__pycache__
+*.zip
